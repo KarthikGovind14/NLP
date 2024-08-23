@@ -1,5 +1,5 @@
 from conll import *
-from config import hyperparams
+
 import torch, json, copy
 import numpy as np
 from tqdm import tqdm
@@ -12,8 +12,10 @@ from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
+# Check if CUDA (GPU) is available, otherwise use CPU
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+PAD_TOKEN = 0
 
-Device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 def load_data(path):
     dataset = []
@@ -21,15 +23,51 @@ def load_data(path):
         dataset = json.loads(f.read())
     return dataset
 
-def get_vocabulary(train_raw, dev_raw, test_raw):
+# Function to construct the language object with vocabulary and mapping
+def get_vocabulary(train_raw, valid_raw, test_raw):
     words = sum([x['utterance'].split() for x in train_raw], [])
-    corpus = train_raw + dev_raw + test_raw
+    corpus = train_raw + valid_raw + test_raw
     slots = set(sum([line['slots'].split() for line in corpus],[]))
     intents = set([line['intent'] for line in corpus])
     lang = Lang(words, intents, slots, cutoff = 0)
 
     return lang
 
+# Custom collate function for data loading
+# Merge sequences by padding to the same length
+def collate_fn(data):
+    def merge(sequences):
+        lengths = [len(seq) for seq in sequences]
+        max_len = 1 if max(lengths) == 0 else max(lengths)
+        padded_seqs = torch.LongTensor(len(sequences), max_len).fill_(PAD_TOKEN)
+        for i, seq in enumerate(sequences):
+            end = lengths[i]
+            padded_seqs[i, :end] = seq
+        padded_seqs = padded_seqs.detach()
+        return padded_seqs, lengths
+    
+    # Sort the data by utterance length
+    data.sort(key = lambda x: len(x['utterance']), reverse = True)
+    new_item = {}
+    # Reorganize the data into batches
+    for key in data[0].keys():
+        new_item[key] = [d[key] for d in data]
+    src_utt, _ = merge(new_item['utterance'])
+    y_slots, y_lengths = merge(new_item["slots"])
+    intent = torch.LongTensor(new_item["intent"])
+
+    src_utt = src_utt.to(DEVICE)
+    y_slots = y_slots.to(DEVICE)
+    intent = intent.to(DEVICE)
+    y_lengths = torch.LongTensor(y_lengths).to(DEVICE)
+
+    new_item["utterances"] = src_utt
+    new_item["intents"] = intent
+    new_item["y_slots"] = y_slots
+    new_item["slots_len"] = y_lengths
+    return new_item
+
+# Language class for vocabulary and mapping
 class Lang:
         # Create word-to-id, slot-to-id, and intent-to-id mappings
     def __init__(self, words, intents, slots, cutoff = 0):
@@ -51,7 +89,7 @@ class Lang:
                 vocab = self.w2id(elements, cutoff = cutoff, unk = unk, load = False)
             return vocab
         else:
-            vocab = {"pad": hyperparams['PadToken']}
+            vocab = {"pad": PAD_TOKEN}
             if unk: vocab["unk"] = len(vocab)
             count = Counter(elements)
             for k, v in count.items():
@@ -77,7 +115,7 @@ class Lang:
                 return vocab
         else:
             vocab = {}
-            if pad: vocab["pad"] = hyperparams['PadToken']
+            if pad: vocab["pad"] = PAD_TOKEN
             for elem in elements:
                 vocab[elem] = len(vocab)
             if pad:
@@ -87,40 +125,6 @@ class Lang:
                 with open("dataset/intent2id.json", "w") as f:
                     json.dump(vocab, f)
             return vocab
-
-
-def collate_fn(data):
-    def merge(sequences):
-        lengths = [len(seq) for seq in sequences]
-        max_len = 1 if max(lengths) == 0 else max(lengths)
-        padded_seqs = torch.LongTensor(len(sequences), max_len).fill_(hyperparams['PadToken'])
-        for i, seq in enumerate(sequences):
-            end = lengths[i]
-            padded_seqs[i, :end] = seq
-        padded_seqs = padded_seqs.detach()
-        return padded_seqs, lengths
-    
-    # Sort the data by utterance length
-    data.sort(key = lambda x: len(x['utterance']), reverse = True)
-    new_item = {}
-    # Reorganize the data into batches
-    for key in data[0].keys():
-        new_item[key] = [d[key] for d in data]
-    src_utt, _ = merge(new_item['utterance'])
-    y_slots, y_lengths = merge(new_item["slots"])
-    intent = torch.LongTensor(new_item["intent"])
-
-    src_utt = src_utt.to(Device)
-    y_slots = y_slots.to(Device)
-    intent = intent.to(Device)
-    y_lengths = torch.LongTensor(y_lengths).to(Device)
-
-    new_item["utterances"] = src_utt
-    new_item["intents"] = intent
-    new_item["y_slots"] = y_slots
-    new_item["slots_len"] = y_lengths
-    return new_item
-
 
 class IntentsAndSlots(data.Dataset):
     def __init__(self, dataset, lang, unk = 'unk'):
